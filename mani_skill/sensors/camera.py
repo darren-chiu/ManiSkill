@@ -66,6 +66,16 @@ class CameraConfig(BaseSensorConfig):
     def __repr__(self) -> str:
         return self.__class__.__name__ + "(" + str(self.__dict__) + ")"
 
+@dataclass
+class EventCameraConfig(CameraConfig):
+    uid: str
+    """uid (str): unique id of the camera"""
+    pose: Pose
+    """Pose of the camera"""
+    event_threshold: float = 0.2
+    """Absolute intensity difference threshold to trigger an event."""
+    use_log_intensity: bool = False
+    """Whether to use log of pixel intensities for difference calculation."""
 
 def update_camera_configs_from_dict(
     camera_configs: Dict[str, CameraConfig], config_dict: Dict[str, dict]
