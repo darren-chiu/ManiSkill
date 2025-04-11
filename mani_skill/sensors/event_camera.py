@@ -1,15 +1,27 @@
 import time
 import torch
+import numpy as np
 import sapien.core as sapien
 
 from .camera import Camera
-from .camera import EventCameraConfig  
 from typing import Dict
 
 from dataclasses import dataclass
 from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.structs.types import Array
 from .camera import CameraConfig, ShaderConfig
+
+
+@dataclass
+class EventCameraConfig(CameraConfig):
+    uid: str
+    """uid (str): unique id of the camera"""
+    pose: Pose
+    """Pose of the camera"""
+    event_threshold: float = 0.2
+    """Absolute intensity difference threshold to trigger an event."""
+    use_log_intensity: bool = False
+    """Whether to use log of pixel intensities for difference calculation."""
 
 class EventCamera(Camera):
     """
@@ -28,7 +40,7 @@ class EventCamera(Camera):
         self.use_log_intensity = getattr(camera_config, 'use_log_intensity', False)
         
         self._previous_frame = None
-        self._previous_time = None
+        self._current_frame = None
         
         # A list to store events: each event is (x, y, time, polarity)
         self._current_events = []
@@ -39,6 +51,7 @@ class EventCamera(Camera):
         """
         Capture a new frame from the SAPIEN camera and compute events by comparing with the previous frame.
         """
+
         self.camera.take_picture() # Takes current sim picture
         rgb_tex = self.camera.get_picture(["Color"]) 
         if len(rgb_tex) == 0:
@@ -48,15 +61,18 @@ class EventCamera(Camera):
         rgb_img = rgb_tex[0]  # shape: (H, W, 4) RGBA in [0,255]
         # Convert to grayscale in [0,1]
         gray_img = self._to_grayscale(rgb_img[..., :3])
+        
         if self.use_log_intensity:
             gray_img = torch.log(gray_img + 1e-5)
+            
+        self._current_frame = gray_img
         
         if self._previous_frame is not None:
-            self._current_events = self._generate_events(gray_img, self._previous_frame)
+            self._current_events = self._generate_events()
         else:
             self._current_events = []
         
-        self._previous_frame = gray_img
+        self._previous_frame = gray_img.clone()
 
     def _to_grayscale(self, rgb_img: torch.Tensor) -> torch.Tensor:
         """
@@ -68,16 +84,14 @@ class EventCamera(Camera):
         # return torch.dot(rgb_img, torch.as_tensor([0.299, 0.587, 0.114], device=self.device)) / 255.0
 
     def _generate_events(
-        self,
-        current_frame: torch.Tensor,
-        prev_frame: torch.Tensor,
-    ):
+        self,):
         """
         Compute pixel differences and return a list of events.
         Each event is (x, y, time, polarity), with polarity +1 if intensity increased,
         and -1 if it decreased. More events == Longer list. This is the inconsistent bandwidth issue!
         """
-        dI = current_frame - prev_frame
+        dI = self._current_frame - self._previous_frame
+        
         event_mask = torch.abs(dI) > self.event_threshold
         if not torch.any(event_mask):
             return []
@@ -88,6 +102,7 @@ class EventCamera(Camera):
         events = []
         for i, (y, x) in enumerate(zip(ys, xs)):
             events.append((x, y, polarity_values[i]))
+        
         return events
 
     def get_event_frame(self) -> torch.Tensor:
@@ -100,12 +115,34 @@ class EventCamera(Camera):
         """
         H, W = self.camera.height, self.camera.width
         event_map = torch.zeros((H, W), dtype=torch.int8, device=self.device)
-        for (x, y, t, pol) in self._current_events:
+        for (x, y, pol) in self._current_events:
             x_i = int(x)
             y_i = int(y)
             if 0 <= x_i < W and 0 <= y_i < H:
                 event_map[y_i, x_i] = pol
         return event_map.reshape(1, -1)
+
+    def unpack_event_frame(self, flat_frame: torch.Tensor, H: int, W: int) -> np.ndarray:
+            """
+            Convert a flattened event frame (with shape (1, H*W)) to an (H, W, 3) RGB image.
+            This should help with visualization.
+            Mapping:
+            - 0    -> black   [0, 0, 0]
+            - +1   -> white   [255, 255, 255]
+            - -1   -> blue    [0, 0, 255]
+            """
+            # Reshape the flattened frame to (H, W)
+            event_map = flat_frame.reshape(H, W).cpu().detach().numpy()
+            # Create a blank color image
+            color_img = np.zeros((H, W, 3), dtype=np.uint8)
+            # Boolean masks for events
+            mask_pos = (event_map == 1)
+            mask_neg = (event_map == -1)
+            # Map positive events to white and negative events to blue.
+            color_img[mask_pos] = [255, 255, 255]  # white
+            color_img[mask_neg] = [0, 0, 255]        # blue
+            # No event (0) remains black.
+            return color_img
 
     def get_obs(self,
                 rgb: bool = True,
@@ -122,8 +159,7 @@ class EventCamera(Camera):
         images_dict = {}
         
         # Capture a new frame and compute events
-        self.capture()
         flattened_event_frame = self.get_event_frame()
         images_dict['event_camera'] = flattened_event_frame
-        
+        # images_dict["Color"] = self.unpack_event_frame(flattened_event_frame, 340, 340)
         return images_dict
